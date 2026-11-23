@@ -1,0 +1,299 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: KBTU CAD SIS 3 - Reproducible Event-Driven + Containerized Order System
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+  ImageUri:
+    Type: String
+    Description: Full ECR image URI with immutable tag
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Default VPC ID
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two public subnets in different AZs
+
+Mappings:
+  Sizing:
+    dev:
+      Cpu: "256"
+      Memory: "512"
+      DesiredCount: 1
+    staging:
+      Cpu: "512"
+      Memory: "1024"
+      DesiredCount: 2
+    prod:
+      Cpu: "512"
+      Memory: "1024"
+      DesiredCount: 2
+
+Resources:
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+
+  OrdersDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
+      ReceiveMessageWaitTimeSeconds: 20
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrdersDLQ.Arn
+        maxReceiveCount: 5
+
+  OrdersQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref OrdersQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt OrdersQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt OrderPlacedRule.Arn
+
+  OrderPlacedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Route OrderPlaced events to SQS
+      EventPattern:
+        source:
+          - !Sub "kbtu.shop.orders.${AWS::StackName}"
+        detail-type:
+          - "OrderPlaced"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OrdersQueue.Arn
+          Id: OrdersQueueTarget
+
+  ConsumerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-orders-consumer"
+      RetentionInDays: 7
+
+  OrdersConsumerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ConsumerLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-orders-consumer"
+      Runtime: nodejs22.x
+      Handler: index.handler
+      CodeUri: consumer/
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrdersTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrdersQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 2
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}-orders-api"
+      RetentionInDays: 7
+
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OrdersAppAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt OrdersTable.Arn
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP to ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow port 8080 from ALB only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  OrdersALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+
+  OrdersTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+
+  OrdersListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref OrdersALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref OrdersTargetGroup
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+
+  OrdersTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-orders-api"
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: !FindInMap [Sizing, !Ref Env, Cpu]
+      Memory: !FindInMap [Sizing, !Ref Env, Memory]
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      ContainerDefinitions:
+        - Name: orders-api
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+          Environment:
+            - Name: ENV
+              Value: !Ref Env
+            - Name: TABLE_NAME
+              Value: !Ref OrdersTable
+            - Name: EVENT_SOURCE
+              Value: !Sub "kbtu.shop.orders.${AWS::StackName}"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AppLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+
+  OrdersEcsService:
+    Type: AWS::ECS::Service
+    DependsOn: OrdersListener
+    Properties:
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref OrdersTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !FindInMap [Sizing, !Ref Env, DesiredCount]
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+      LoadBalancers:
+        - ContainerName: orders-api
+          ContainerPort: 8080
+          TargetGroupArn: !Ref OrdersTargetGroup
+
+Outputs:
+  ServiceUrl:
+    Description: Public ALB URL for Orders API
+    Value: !Sub "http://${OrdersALB.DNSName}"
+  OrdersQueueUrl:
+    Description: SQS Queue URL
+    Value: !Ref OrdersQueue
+  OrdersDLQUrl:
+    Description: Dead-Letter Queue URL
+    Value: !Ref OrdersDLQ
+  OrdersTableName:
+    Description: DynamoDB Table Name
+    Value: !Ref OrdersTable
